@@ -278,6 +278,101 @@ Watch decisions in real time:
 tail -f ~/.claude/permissionDecisions.jsonl | jq '.'
 ```
 
+## Self-auditing with Claude Code
+
+The logging isn't just for manual inspection — you can ask Claude Code itself to
+analyze the logs and suggest improvements. This is one of the best parts of the
+setup: the agent audits its own permission system.
+
+### Sample prompts
+
+Copy and paste these into Claude Code after you've been using it for a few days:
+
+**Audit auto-approval hit rate:**
+
+> Read `~/.claude/permissionPrompts.jsonl` and `~/.claude/permissionDecisions.jsonl`
+> from the last 3 days. Calculate: what percentage of Bash permission requests were
+> auto-approved? What percentage went to user prompt? Break it down by hook — which
+> hooks are doing the most work? Show the top 10 most common commands that fell
+> through to user prompt (weren't auto-approved), and recommend whether any of them
+> should be added to the structural allowlist in `scripts/auto-approve.ts` or
+> covered by a new compound hook.
+
+**Find approval gaps:**
+
+> Analyze `~/.claude/permissionPrompts.jsonl` for the past week. Find all Bash
+> commands that the user manually approved. For each one, classify whether it could
+> have been auto-approved safely. Which commands repeat often? Suggest specific
+> changes to the hooks — new safe tools to add, new compound patterns, or new
+> structural paths — that would increase the auto-approval rate without weakening
+> security.
+
+**Review blocked commands:**
+
+> Read `~/.claude/toolExecutions.jsonl` and grep stderr from recent sessions for
+> "BLOCKED" messages from `block-dangerous-commands.sh`. Were any legitimate
+> commands blocked? Are the block rules too aggressive or not aggressive enough?
+> Also check `block-sensitive-reads.sh` blocks — did any block on a path that
+> turned out to be safe? Recommend adjustments.
+
+**Check for dangerous patterns that slipped through:**
+
+> Cross-reference `~/.claude/toolExecutions.jsonl` against the block rules in
+> `hooks/block-dangerous-commands.sh`. Find any executed Bash commands that
+> matched patterns the block hook SHOULD have caught but didn't (maybe due to
+> unexpected quoting, subshells, or command variants). Are there gaps in the
+> regex patterns?
+
+**Haiku classifier accuracy:**
+
+> Read `~/.claude/permissionDecisions.jsonl` and filter for stage2 decisions
+> (Haiku classifier). What categories does Haiku most often return? Are there
+> commands where Haiku classified something as safe that you think is borderline?
+> Are there commands Haiku refused that stage1 would have also refused (wasted
+> API calls)? Recommend category additions or removals from the `SAFE_CATEGORIES`
+> set in `auto-approve.ts`.
+
+**Optimize the hook pipeline:**
+
+> Look at all the compound auto-approve hooks (git, go, npm, make, awk-sed) and
+> the haiku-fallback hook. Is there overlap? Could some hooks be merged? Are there
+> hooks that never fire and can be removed? Check `permissionDecisions.jsonl` to
+> see which hooks actually contribute approvals. Recommend a cleaner hook ordering.
+
+### What this feedback loop looks like
+
+```
+    ┌──────────────────────────────┐
+    │  Claude Code does work       │
+    │  Hooks log every decision    │
+    └──────────┬───────────────────┘
+               │
+    ┌──────────▼───────────────────┐
+    │  Logs accumulate:            │
+    │  - What was auto-approved    │
+    │  - What needed user prompt   │
+    │  - What was blocked          │
+    └──────────┬───────────────────┘
+               │
+    ┌──────────▼───────────────────┐
+    │  You ask Claude to audit     │
+    │  the logs and suggest        │
+    │  improvements                │
+    └──────────┬───────────────────┘
+               │
+    ┌──────────▼───────────────────┐
+    │  Claude edits the hooks      │
+    │  - Adds safe tools           │
+    │  - Tightens block patterns   │
+    │  - Removes dead rules        │
+    └──────────┬───────────────────┘
+               │
+               └──────→ back to work, fewer prompts
+```
+
+Over a few weeks of this cycle, the auto-approval rate should converge above 95%
+for routine development work.
+
 ---
 
 ## License
