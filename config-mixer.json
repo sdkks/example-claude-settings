@@ -1,0 +1,11 @@
+{
+  "sources": {
+    "playwright": {
+      "type": "remote",
+      "location": "npx @playwright/mcp@latest",
+      "description": "Playwright browser automation MCP server",
+      "keys": [],
+      "enabled": false
+    }
+  }
+}
