@@ -188,12 +188,43 @@ npm install shell-quote
 The `auto-approve.ts` script runs via `npx tsx`, which auto-installs if needed,
 but `shell-quote` must be available.
 
-### 5. Set up your environment
+### 5. Set up the ENVIRONMENT variable
+
+This repo uses the `ENVIRONMENT` shell variable to distinguish between machines.
+The idea: you have one copy of this repo on your work laptop and another on your
+personal machine. They share the same committed files but produce different
+`settings.json` at restore time.
+
+**Why two environments?**
+
+| Aspect | Work | Home |
+|--------|------|------|
+| API backend | Bedrock via company gateway | Anthropic API directly |
+| Model | `us.anthropic.claude-sonnet-4-6` | `sonnet[1m]` |
+| Plugins | Work-specific (deploy, eng tools) | Generic (LSPs, frontend, termin8r) |
+| Plugin marketplace | Company private marketplace | Official + community marketplaces |
+| Auth | `ANTHROPIC_AUTH_TOKEN` (Bedrock) | `ANTHROPIC_API_KEY` |
+| Auto-permission-prompt | Shows prompts | Skips prompts (`skipAutoPermissionPrompt`) |
+
+**How it works:**
+
+The `ENVIRONMENT` variable controls which jsonnet overlay gets merged at restore
+time. `common.jsonnet` is always merged; then `settings.work.jsonnet` or
+`settings.home.jsonnet` is layered on top.
+
+Set it in your shell profile so it's always available:
 
 ```bash
-# In your shell profile (.zshrc / .bashrc):
-export ENVIRONMENT=home   # or work
+# ~/.zshrc or ~/.bashrc
+export ENVIRONMENT=home    # on your personal machine
+
+# On your work machine:
+export ENVIRONMENT=work
 ```
+
+The Makefile reads this variable. `make save-config` extracts environment-specific
+keys from your live `settings.json` into the correct jsonnet file. `make restore-config`
+rebuilds `settings.json` by merging all three layers.
 
 ### 6. Restore and test
 
@@ -204,6 +235,118 @@ mv settings.json.recovered.home settings.json
 # Start Claude Code and watch the logs
 tail -f ~/.claude/permissionDecisions.jsonl
 ```
+
+---
+
+## Keeping secrets out of the repo
+
+**The most important rule: `settings.json` is never committed. Ever.**
+
+This repo holds API tokens, auth keys, and credentials in `settings.json`.
+Accidentally pushing that file — even to a private repo — creates real exposure.
+The repo has multiple layers of defense against this.
+
+### Defense 1: `.gitignore`
+
+`settings.json` is in `.gitignore`. Git will never track it:
+
+```gitignore
+settings.json
+settings.json.bak
+settings.json.orig
+settings.json.recovered.*
+```
+
+### Defense 2: The sanitize script
+
+`make commit-push` does NOT push `settings.json`. Instead, it runs
+`scripts/sanitize-settings.sh`, which:
+
+- Strips all work-specific keys (Bedrock env vars, work plugins, work marketplace)
+- Strips all home-specific keys (API key, `skipAutoPermissionPrompt`)
+- Strips common sections (hooks, plugins — these live in `common.jsonnet` instead)
+- Replaces any value whose key matches `TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL` with `<REDACTED>`
+- Strips the model field if it's a Bedrock ARN or bare `sonnet`
+
+The output is `settings.json.example` — a neutral permissions baseline with zero
+secrets. Only this sanitized file is committed and pushed.
+
+### Defense 3: Separate config layers
+
+The actual values live in three committed files, each safe on its own:
+
+```
+settings.json          ← live config, NEVER committed, in .gitignore
+  built from:
+  settings.json.example  ← permissions (committed, no secrets)
+  + common.jsonnet       ← hooks, plugins, settings (committed, no secrets)
+  + settings.work.jsonnet ← Bedrock config, work plugins (committed, tokens redacted)
+  + settings.home.jsonnet ← API key setup (committed, tokens redacted)
+```
+
+The jsonnet files use `<REDACTED>` as placeholders for actual secrets. You fill
+those in once after `make restore-config` and they stay in your local, gitignored
+`settings.json`.
+
+### Defense 4: Pre-commit hook
+
+Install a pre-commit hook that blocks commits containing secrets. Create
+`.pre-commit-config.yaml` in the repo root:
+
+```yaml
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: detect-private-key
+      - id: detect-aws-credentials
+        args: [--allow-missing-credentials]
+
+  - repo: local
+    hooks:
+      - id: forbid-settings-json
+        name: Block settings.json from being committed
+        entry: |
+          bash -c 'git diff --cached --name-only | grep -q "settings.json$$" && echo "ERROR: settings.json must never be committed. Run make commit-push instead." && exit 1 || exit 0'
+        language: system
+        pass_filenames: false
+
+      - id: sanitize-example
+        name: Verify settings.json.example is clean
+        entry: |
+          bash -c 'grep -Eq "(ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|sk-|api_key.*[A-Za-z0-9]{20,})" settings.json.example && echo "ERROR: settings.json.example may contain secrets. Run make sanitize." && exit 1 || exit 0'
+        language: system
+        pass_filenames: false
+```
+
+Then install it:
+
+```bash
+pip install pre-commit
+pre-commit install
+```
+
+Now every `git commit` will check for private keys, AWS credentials, accidental
+`settings.json` staging, and secrets in the example file.
+
+### The commit workflow
+
+Never `git commit && git push` this repo directly. Always use:
+
+```bash
+ENVIRONMENT=home make commit-push
+```
+
+This runs the full pipeline: save config → sanitize → commit → push. It guarantees
+`settings.json.example` is up-to-date and clean before anything reaches the remote.
+
+### What if I accidentally commit a secret?
+
+1. Rotate the credential immediately (API key, token, etc.)
+2. `git rebase -i` to remove the commit
+3. Force push (if you're sure no one pulled the bad commit)
+4. Run `make sanitize` to regenerate the clean example
+5. Verify with `grep -r "<your-secret>" .` that nothing remains
 
 ---
 
