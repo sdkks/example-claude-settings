@@ -9,16 +9,29 @@ SAVE_HOME := scripts/save-home-config.sh
 SAVE_COMMON := scripts/save-common-config.sh
 RESTORE  := scripts/restore-config.sh
 
-.PHONY: all sanitize save-config restore-config commit-push
+.PHONY: all sanitize save-config save-common-config save-work-config save-home-config restore-config commit-push
 
 all: commit-push
 
 save-config: $(SETTINGS)
 	@if [ -z "$(ENVIRONMENT)" ]; then \
 	  echo "ERROR: ENVIRONMENT is not set. Set ENVIRONMENT=work or ENVIRONMENT=home." >&2; exit 1; fi
+	@$(MAKE) save-common-config
 	@if [ "$(ENVIRONMENT)" = "work" ]; then $(MAKE) save-work-config; \
 	elif [ "$(ENVIRONMENT)" = "home" ]; then $(MAKE) save-home-config; \
 	else echo "ERROR: ENVIRONMENT must be 'work' or 'home'" >&2; exit 1; fi
+
+save-common-config: $(SETTINGS)
+	@chmod +x $(SAVE_COMMON)
+	@$(SAVE_COMMON)
+
+save-work-config: $(SETTINGS)
+	@chmod +x $(SAVE_WORK)
+	@$(SAVE_WORK)
+
+save-home-config: $(SETTINGS)
+	@chmod +x $(SAVE_HOME)
+	@$(SAVE_HOME)
 
 sanitize: $(SETTINGS)
 	@chmod +x $(SANITIZE)
