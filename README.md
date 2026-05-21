@@ -69,19 +69,16 @@ wins. If none output a decision, the user gets a prompt.
 
 | Hook | What it approves | When it kicks in |
 |------|-----------------|-----------------|
-| `auto-approve.sh` | Delegates to `scripts/auto-approve.ts` | Every Bash request |
+| `auto-approve.ts` | Two-stage Bash approval: structural allowlist (~100 safe tools) then Haiku LLM classifier. Handles compound commands, shell operators, and all toolchains (git, go, npm, make, awk/sed) in a single hook. | Every Bash request |
 | `auto-approve-read-structural.sh` | Read/Edit paths with variable segments (worktrees, generated dirs) | Every Read/Edit request |
-| `auto-approve-compound-git.sh` | Compound git commands (`cd src && git log`, `git add . && git commit`) | Commands containing `git` |
-| `auto-approve-compound-go.sh` | Go toolchain compound commands | Commands containing `go`/`gofmt`/`golangci-lint` |
-| `auto-approve-compound-npm.sh` | npm/npx/node commands (not publish/unpublish) | Commands containing `npm`/`npx`/`node` |
-| `auto-approve-compound-make.sh` | Make with known-safe targets (build, test, lint, etc.) | Commands containing `make` |
-| `auto-approve-compound-awk-sed.sh` | awk and sed in pipelines (sed -i only on safe paths) | Commands containing `awk`/`sed` |
-| `auto-approve-haiku-fallback.sh` | Two-stage: structural check then Haiku LLM sanity check | Commands missed by all other hooks |
 | `log-permission-requests.sh` | Logs every request to `permissionPrompts.jsonl` | Always (never approves, just logs) |
 
 ### `auto-approve.ts` in detail
 
-This is the main Bash auto-approval engine. It has two stages:
+This is the single Bash auto-approval engine. It replaces what was previously nine
+separate hook scripts (one wrapper + six compound hooks + a Haiku fallback + the core
+engine). All compound command handling, toolchain-specific logic, and multi-stage
+classification is now consolidated here.
 
 **Stage 1 — Structural (instant, no API call):**
 1. Parse the command into segments split by `&&`, `;`, `|`, `\n`
@@ -129,7 +126,8 @@ via stderr, and Claude can try a different approach.
 
 | Script | Purpose |
 |--------|---------|
-| `auto-approve.ts` | Bash auto-approval engine (described above) |
+| `auto-approve.ts` | Bash auto-approval engine (described above). Runs via `npx tsx` as a PermissionRequest hook. |
+| `auto-approve.test.ts` | Vitest test suite for auto-approve.ts. Covers structural parsing, command segmentation, Haiku prompt assembly, and shell-quote edge cases. |
 | `sanitize-settings.sh` | Reads `settings.json`, strips secrets/work/home sections, writes clean `settings.json.example` |
 | `restore-config.sh` | Disaster recovery: merges `settings.json.example` + `common.jsonnet` + environment jsonnet → `settings.json.recovered.{work,home}` |
 
@@ -137,7 +135,10 @@ via stderr, and Claude can try a different approach.
 
 | Target | What it does |
 |--------|-------------|
-| `make commit-push` | Save config → sanitize → commit → push. Requires `ENVIRONMENT=work` or `ENVIRONMENT=home`. |
+| `make commit-push` | Run tests → save config → sanitize → commit → push. Requires `ENVIRONMENT=work` or `ENVIRONMENT=home`. |
+| `make test` | Run all tests: `test-vitest` (auto-approve.ts) + `test-hooks` (block-dangerous-commands.sh) |
+| `make test-vitest` | Run auto-approve.ts unit tests via vitest |
+| `make test-hooks` | Run shell-based hook integration tests |
 | `make sanitize` | Regenerate `settings.json.example` from live `settings.json` |
 | `make restore-config` | Rebuild `settings.json.recovered.{ENVIRONMENT}` from committed layers |
 | `make save-config` | Extract work or home config into the matching jsonnet file |
@@ -174,7 +175,6 @@ Every `.sh` and `.ts` file. Some have assumptions about directory layout
 
 - `settings.json.example`: replace `/Users/macosuser/` with your username
 - `auto-approve-read-structural.sh`: update or remove path patterns that don't apply
-- `auto-approve-haiku-fallback.sh`: remove project-specific path references
 - `settings.work.jsonnet`: replace example company plugins/marketplace with yours
 
 ### 3. Wire up the hooks
@@ -187,7 +187,7 @@ Hooks are configured in `common.jsonnet`. The structure is:
     {
       "matcher": "Bash",
       "hooks": [
-        { "type": "command", "command": "~/.claude/hooks/some-hook.sh" }
+        { "type": "command", "command": "~/.claude/scripts/auto-approve.ts" }
       ]
     }
   ]
@@ -198,14 +198,15 @@ A `matcher` of `""` or `"*"` matches all tool types. Order matters — hooks run
 in sequence for PermissionRequest (first approval wins) but all PreToolUse hooks
 run and any can block.
 
-### 4. Install the TypeScript dependency
+### 4. Install dependencies
 
 ```bash
-npm install shell-quote
+npm install
 ```
 
-The `auto-approve.ts` script runs via `npx tsx`, which auto-installs if needed,
-but `shell-quote` must be available.
+`auto-approve.ts` runs via `npx tsx` (shebang: `#!/usr/bin/env npx tsx`), which
+auto-installs if needed, but `shell-quote` must be available. The test suite uses
+vitest.
 
 ### 5. Set up the ENVIRONMENT variable
 
@@ -356,8 +357,8 @@ Never `git commit && git push` this repo directly. Always use:
 ENVIRONMENT=home make commit-push
 ```
 
-This runs the full pipeline: save config → sanitize → commit → push. It guarantees
-`settings.json.example` is up-to-date and clean before anything reaches the remote.
+This runs the full pipeline: test → save config → sanitize → commit → push. It guarantees
+tests pass and `settings.json.example` is up-to-date and clean before anything reaches the remote.
 
 ### What if I accidentally commit a secret?
 
@@ -387,24 +388,15 @@ What this setup does NOT guarantee:
 - **The agent can still `cat` any non-credential file on your system** (by design — it needs to read code)
 - **The agent can still write to `~/Dev/` and `/tmp/`** (by design — it needs to edit code)
 - **Haiku classification can have false positives** — a novel dangerous command might get approved
-- **The compound hooks have gaps** — commands combining tools across domains may fall through to user prompt
 - **This is not a sandbox** — the agent has the same filesystem access as your user account
 
 ---
 
 ## Customizing for your workflow
 
-### Adding a new safe make target
-
-Edit `auto-approve-compound-make.sh` and add your target to the allowlist:
-
-```bash
-if echo "$part" | grep -qE '^make (build|lint|test|your-target-here)(\s|$)'; then continue; fi
-```
-
 ### Adding a new safe tool to structural approval
 
-Edit `auto-approve.ts` and add the binary name to the `SAFE_TOOLS` Set.
+Edit `scripts/auto-approve.ts` and add the binary name to the `SAFE_TOOLS` Set.
 
 ### Adding a new structural read path
 
@@ -420,6 +412,22 @@ fi
 
 Edit `block-dangerous-commands.sh` and add a new check block following the
 existing pattern. Use exit 2 to block, echo the reason to stderr.
+
+---
+
+## Tests
+
+The repo includes tests for the auto-approval engine and security hooks:
+
+```bash
+make test          # run all tests
+make test-vitest   # auto-approve.ts unit tests
+make test-hooks    # block-dangerous-commands.sh integration tests
+```
+
+The vitest suite covers command parsing, structural allowlisting, Haiku prompt
+assembly, shell-quote edge cases, and regression tests for previously-fixed bugs.
+CI runs `make test` before every push via the `commit-push` target.
 
 ---
 
@@ -457,17 +465,15 @@ Copy and paste these into Claude Code after you've been using it for a few days:
 > auto-approved? What percentage went to user prompt? Break it down by hook — which
 > hooks are doing the most work? Show the top 10 most common commands that fell
 > through to user prompt (weren't auto-approved), and recommend whether any of them
-> should be added to the structural allowlist in `scripts/auto-approve.ts` or
-> covered by a new compound hook.
+> should be added to the structural allowlist in `scripts/auto-approve.ts`.
 
 **Find approval gaps:**
 
 > Analyze `~/.claude/permissionPrompts.jsonl` for the past week. Find all Bash
 > commands that the user manually approved. For each one, classify whether it could
 > have been auto-approved safely. Which commands repeat often? Suggest specific
-> changes to the hooks — new safe tools to add, new compound patterns, or new
-> structural paths — that would increase the auto-approval rate without weakening
-> security.
+> changes to the hooks — new safe tools to add, or new patterns — that would
+> increase the auto-approval rate without weakening security.
 
 **Review blocked commands:**
 
@@ -496,12 +502,13 @@ Copy and paste these into Claude Code after you've been using it for a few days:
 
 **Optimize the hook pipeline:**
 
-> Look at all the compound auto-approve hooks (git, go, npm, make, awk-sed) and
-> the haiku-fallback hook. Is there overlap? Could some hooks be merged? Are there
-> hooks that never fire and can be removed? Check `permissionDecisions.jsonl` to
-> see which hooks actually contribute approvals. Recommend a cleaner hook ordering.
+> Review the auto-approve.ts structural allowlist and Haiku classifier results in
+> `~/.claude/permissionDecisions.jsonl`. Are there tools in the allowlist that
+> are never used? Are there commonly-used tools that should be added? Check
+> whether the two-stage approach is working — what percentage of approvals come
+> from stage 1 vs stage 2?
 
-### What this feedback loop looks like
+## What this feedback loop looks like
 
 ```
     ┌──────────────────────────────┐
