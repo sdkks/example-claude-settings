@@ -10,6 +10,8 @@
  *
  * Tries Anthropic API first (home), then Bedrock (work), then CLI fallback.
  *
+ * Tries Anthropic API first (home), then Bedrock (work), then CLI fallback.
+ *
  * Outputs hookSpecificOutput JSON to stdout on allow, nothing on skip/error.
  * Side-effects: permissionDecisions.jsonl, permissionRequestHashes sentinel.
  */
@@ -210,11 +212,13 @@ const SAFE_TOOLS = new Set([
   // Data
   "jq", "xargs", "strings",
   // Scripting runtimes (read/build use)
-  "python3", "python", "node", "ruby",
+  "python3", "python", "node", "ruby", "bun",
   // Node toolchain
   "npm", "npx", "fnm", "nvm", "yarn", "pnpm",
   // Go toolchain
-  "go", "gofmt", "goimports", "golangci-lint",
+  "go", "gofmt", "goimports", "golangci-lint", "uv", "cargo", "docker", "lsof", "seq",
+  // Python tooling
+  "pip", "pip3", "pipx",
   // Git
   "git",
   // GitHub CLI
@@ -223,12 +227,18 @@ const SAFE_TOOLS = new Set([
   "kubectl",
   // Make
   "make",
+  // Shell interpreters (running scripts; block hook handles dangerous content)
+  "bash", "sh", "zsh",
+  // Internal / dev CLIs
+  "cicd", "semgrep", "openssl",
+  // Linux package query (read-only operations; mutating ones gated by block hook)
+  "apt", "apt-cache", "apt-get", "dpkg",
   // Network (localhost only — checked separately)
   "curl", "wget",
   // Shell built-ins
   "cd", "true", "false", "exit", "source", ".", "test", "[",
-  // File system mutations (block hook handles dangerous misuse)
-  "mkdir", "rmdir", "chmod", "touch", "ln", "unlink", "tar", "zip", "unzip", "cp", "mv",
+  // File system mutations (block hook handles dangerous misuse like rm -rf /)
+  "mkdir", "rmdir", "rm", "chmod", "touch", "ln", "unlink", "tar", "zip", "unzip", "cp", "mv",
   // Process
   "sleep", "wait", "kill", "pkill", "killall", "timeout",
   // Terminal multiplexers
@@ -266,6 +276,7 @@ export function checkCommand(cmd: string, allTokens: string[]): Decision {
   if (!stripped) return "allow";
 
   // Variable assignment standing alone as a command (FOO=bar with no following cmd)
+  // Check on stripped before path-splitting so LOG=~/path matches correctly
   if (/^[a-zA-Z_][a-zA-Z_0-9]*=/.test(stripped)) return "allow";
 
   const word = stripped.split("/").pop()!; // handle /usr/bin/grep etc.
@@ -295,14 +306,40 @@ export function checkCommand(cmd: string, allTokens: string[]): Decision {
   return "skip";
 }
 
+// Transparent prefix wrappers — strip these and check the next word as the real command
+// sudo intentionally excluded — privilege escalation should always prompt
+const PREFIX_WRAPPERS = new Set(["time", "nice", "nohup", "command", "exec"]);
+
+function effectiveCommandWord(segment: Segment): string {
+  let i = 0;
+  // Skip leading KEY=val env assignments
+  while (i < segment.length && /^[A-Z_][A-Z_0-9]*=/.test(segment[i])) i++;
+  // Skip transparent wrappers and any flags that follow them (e.g. `time -p`, `nice -n 10`)
+  while (i < segment.length) {
+    const tok = segment[i];
+    const word = tok.split("/").pop() ?? tok;
+    if (PREFIX_WRAPPERS.has(word)) {
+      i++;
+      // skip flags / numeric args belonging to the wrapper
+      while (i < segment.length && /^-/.test(segment[i])) {
+        i++;
+        if (i < segment.length && /^[0-9]+$/.test(segment[i])) i++;
+      }
+      continue;
+    }
+    break;
+  }
+  return segment[i] ?? "";
+}
+
 export function stage1(command: string): StageResult {
   const segments = parseSegments(command);
   const all = allWords(segments);
 
   for (const segment of segments) {
     if (segment.length === 0) continue;
-    // First non-empty token is the command; the rest are arguments (always safe)
-    const cmdWord = segment[0];
+    const cmdWord = effectiveCommandWord(segment);
+    if (!cmdWord) continue;
     if (checkCommand(cmdWord, all) === "skip") {
       return { decision: "skip", stage: "stage1", reason: `command not in allowlist: ${cmdWord}` };
     }

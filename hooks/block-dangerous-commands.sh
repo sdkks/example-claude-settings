@@ -3,10 +3,6 @@
 # PreToolUse hook: blocks dangerous bash commands before execution.
 # Exit 2 = block the action (reason sent to Claude via stderr).
 # Exit 0 = allow the action to proceed.
-#
-# This is the security gate — it runs after permission is granted.
-# Covers: destructive file ops, disk formatting, chmod 777, curl-to-shell,
-# force-push to main/master, git reset --hard, broad sudo, env dumping, etc.
 
 INPUT=$(cat)
 TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // empty')
@@ -19,20 +15,28 @@ fi
 COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
 
 # --- Destructive file operations ---
-if echo "$COMMAND" | grep -qE 'rm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+)?(/|~|\$HOME|\.\./)' && \
-   ! echo "$COMMAND" | grep -qE 'rm\s+-f\s+/tmp/.+'; then
+# Match any rm flag (short like -rf / -fr / -Rfv, or long like --recursive / --force).
+# RM_FLAG matches a single flag token; (RM_FLAG\s+)* matches zero or more leading flags.
+RM_FLAG='(-[a-zA-Z]+|--[a-zA-Z][a-zA-Z-]*)'
+
+# rm targeting absolute root paths, home, or parent — any flag combination (or none)
+# Allow only clearly scratch paths: /tmp/*, /private/tmp/*, /var/tmp/*, /var/folders/*
+if echo "$COMMAND" | grep -qE "\brm\s+(${RM_FLAG}\s+)*(/|~|\\\$HOME|\.\./)" && \
+   ! echo "$COMMAND" | grep -qE "\brm\s+(${RM_FLAG}\s+)*(/private/tmp|/var/tmp|/var/folders|/tmp)/[^[:space:]]+"; then
   echo "BLOCKED: Destructive rm targeting root, home, or parent directory" >&2
   exit 2
 fi
 
-if echo "$COMMAND" | grep -qE 'rm\s+-[a-zA-Z]*r[a-zA-Z]*f|rm\s+-[a-zA-Z]*f[a-zA-Z]*r'; then
-  # Allow rm -rf on clearly scoped paths (tmp, build artifacts, node_modules, etc.)
-  if echo "$COMMAND" | grep -qE 'rm\s+-rf\s+(\./)?(tmp|dist|build|node_modules|\.next|__pycache__|\.pytest_cache|\.mypy_cache|coverage|\.cache)\b'; then
-    exit 0
-  fi
-  # Block rm -rf without a clearly scoped target
-  if echo "$COMMAND" | grep -qE 'rm\s+-rf\s+(/|\*|~|\.\.|\.?\s*$)'; then
-    echo "BLOCKED: Broad rm -rf without a scoped target path" >&2
+# Recursive rm (-r/-R in any short combo, or --recursive) — block broad/relative-but-dangerous targets
+if echo "$COMMAND" | grep -qE '\brm\s+(-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)\b'; then
+  # Allow rm -r{,f} on clearly scoped paths (relative build artifacts or scratch dirs)
+  if echo "$COMMAND" | grep -qE "\brm\s+(${RM_FLAG}\s+)+(\./)?(tmp|dist|build|node_modules|\.next|__pycache__|\.pytest_cache|\.mypy_cache|coverage|\.cache)\b"; then
+    : # allow
+  elif echo "$COMMAND" | grep -qE "\brm\s+(${RM_FLAG}\s+)+(/private/tmp|/var/tmp|/var/folders|/tmp)/[^[:space:]]+"; then
+    : # allow
+  # Block recursive rm with broad / unscoped targets (/, *, ~, .., bare ., or nothing)
+  elif echo "$COMMAND" | grep -qE "\brm\s+(${RM_FLAG}\s+)+(/|\*|~|\.\.|\.?\s*($|&|\|))"; then
+    echo "BLOCKED: Broad recursive rm without a scoped target path" >&2
     exit 2
   fi
 fi
@@ -66,7 +70,7 @@ if echo "$COMMAND" | grep -qiE '(DROP|TRUNCATE)\s+(TABLE|DATABASE|SCHEMA)\b'; th
 fi
 
 # --- Fork bomb ---
-if echo "$COMMAND" | grep -qE ':\(\)\{.*\|.*&\}'; then
+if echo "$COMMAND" | grep -qE ':\(\)\s*\{.*\|.*&\s*\}'; then
   echo "BLOCKED: Fork bomb detected" >&2
   exit 2
 fi
@@ -117,8 +121,25 @@ if echo "$COMMAND" | grep -qE '(mv|cp)\s+.*\s+(~/\.(ssh|gnupg|bashrc|zshrc|gitco
 fi
 
 # --- Reading sensitive credential directories ---
-if echo "$COMMAND" | grep -qE '(cat|less|more|head|tail|grep|rg|bat|strings|xxd|base64|cp|tar|zip|scp)\s+.*(\$HOME|~|/Users/\w+)/\.(aws|docker|kube|gcloud|ssh|gnupg|config/gh|netrc)'; then
+if echo "$COMMAND" | grep -qE '(cat|less|more|head|tail|grep|rg|bat|strings|xxd|base64|cp|tar|zip|scp|awk|sed|perl|ruby|python[23]?|node)\s+.*(\$HOME|~|/Users/\w+)/\.(aws|docker|kube|gcloud|ssh|gnupg|config/gh|netrc)'; then
   echo "BLOCKED: Reading from sensitive credential directory" >&2
+  exit 2
+fi
+
+# --- In-place editors (awk -i inplace, sed -i, perl -i) writing to sensitive paths ---
+if echo "$COMMAND" | grep -qE '(awk\s+-i\s+inplace|sed\s+-i(\s+[^[:space:]]+)?|perl\s+-i(\.[^[:space:]]+)?)\s+.*(\$HOME|~|/Users/[a-zA-Z0-9_]+|/etc/|/var/)'; then
+  echo "BLOCKED: In-place edit (awk/sed/perl) targeting home, /etc, or /var" >&2
+  exit 2
+fi
+
+# --- awk/sed/perl shell-escape patterns ---
+# system("…"), `…`, getline … "/etc/passwd|shadow"
+if echo "$COMMAND" | grep -qE '(awk|sed|perl)\s+.*\bsystem\s*\('; then
+  echo "BLOCKED: awk/sed/perl invoking system() — shell escape" >&2
+  exit 2
+fi
+if echo "$COMMAND" | grep -qE '(awk|gawk)\s+.*getline.*(/etc/(passwd|shadow|sudoers)|\.ssh/|\.aws/|\.gnupg/)'; then
+  echo "BLOCKED: awk getline reading credential/system files" >&2
   exit 2
 fi
 

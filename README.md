@@ -146,6 +146,25 @@ via stderr, and Claude can try a different approach.
 
 ## How to use this (if you want to)
 
+> **Tip: Let Claude Code do the heavy lifting.** If the hooks and scripts here look
+> daunting, you don't need to port everything yourself. Back up your existing
+> `~/.claude` directory, then ask Claude Code to read this repo and implement the
+> sections you want in your own setup:
+>
+> ```bash
+> # Before you start
+> tar -czf ~/.claude-backup-$(date +%Y%m%d).tar.gz -C ~ .claude
+> # or: zip -r ~/.claude-backup-$(date +%Y%m%d).zip ~/.claude
+> ```
+>
+> Then start a Claude Code session and try prompts like:
+>
+> - *"Read the hooks in this example repo, compare them to my ~/.claude/hooks/,
+>   and add the security checks I'm missing from block-dangerous-commands.sh."*
+> - *"Port the auto-approve.ts pipeline into my setup but adapt the safe-tools
+>   list to my toolchain."*
+> - *"Set up the Makefile test targets for my existing hook tests."*
+
 ### 1. Read everything first
 
 Every `.sh` and `.ts` file. Some have assumptions about directory layout
