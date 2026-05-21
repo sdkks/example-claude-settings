@@ -8,10 +8,6 @@
  *   Stage 2: Haiku category classifier (only when Stage 1 skips) — classifies
  *            what the command does and approves if all categories are safe.
  *
- * Tries Anthropic API first (home), then Bedrock (work), then CLI fallback.
- *
- * Tries Anthropic API first (home), then Bedrock (work), then CLI fallback.
- *
  * Outputs hookSpecificOutput JSON to stdout on allow, nothing on skip/error.
  * Side-effects: permissionDecisions.jsonl, permissionRequestHashes sentinel.
  */
@@ -44,7 +40,6 @@ const DECISIONS_LOG = `${HOME}/.claude/permissionDecisions.jsonl`;
 const HASHES_FILE = `${HOME}/.claude/permissionRequestHashes`;
 const LOCK_DIR = `${HOME}/.claude/permissionRequestHashes.lock.d`;
 const HAIKU_TIMEOUT_MS = 15_000;
-
 // Bedrock (work environment) — set these in your env
 const BEDROCK_MODEL = process.env.BEDROCK_HAIKU_MODEL ?? "us.anthropic.claude-haiku-4-5-20251001-v1:0";
 const BEDROCK_GATEWAY = process.env.BEDROCK_GATEWAY ?? "ai-gateway.example.com";
@@ -56,7 +51,7 @@ const ANTHROPIC_BASE_URL = process.env.ANTHROPIC_BASE_URL ?? "https://api.anthro
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY ?? "";
 
 // Dynamically discover haiku model from gateway so we don't hardcode aliases
-// that may differ between litellm, 7-bridges, or real Anthropic.
+// that may differ between litellm (port 4000), 7-bridges (port 4001), or real Anthropic.
 let _discoveredHaikuModel: string | null = null;
 
 function discoverHaikuModel(): Promise<string> {
@@ -132,35 +127,65 @@ export type Segment = string[]; // ordered word tokens within one simple command
  * Parse a shell command into segments separated by operators (&& || ; | & \n).
  * Within each segment, only word tokens are kept (operators and redirections dropped).
  * shell-quote handles quoting, $(...), globs correctly.
+ *
+ * Redirections are stripped AFTER shell-quote parsing so that the parser's own
+ * quote/escape handling prevents > inside quoted strings from being treated as
+ * redirect operators. The old regex-based approach ran before parsing and was
+ * blind to quoting, corrupting commands like `git commit -m "fix: > redirect"`.
  */
 export function parseSegments(command: string): Segment[] {
-  // Strip redirections before parsing so they don't produce spurious word tokens
   let cleaned = command;
   // Strip comment lines (# ...) — shell-quote treats # as a comment token and
   // swallows all subsequent text including newlines
   cleaned = cleaned.replace(/^[^\S\n]*#[^\n]*/gm, "");
   // Strip heredocs: <<[-] 'DELIM' or DELIM (with optional trailing args on opener)
   cleaned = cleaned.replace(/<<-?\s*['"]?(\w+)['"]?[^\n]*\n[\s\S]*?\n\s*\1\b/g, "");
-  cleaned = cleaned
-    .replace(/\d*>>&?\s*\/dev\/null/g, "")
-    .replace(/\d*>&\d+/g, "")
-    .replace(/\d*>>?\/dev\/null/g, "")
-    .replace(/\d*>>?\s*\S+/g, "")  // strip output redirects (> file, >> file)
-    .replace(/<\s*\S+/g, "");      // strip input redirects (< file)
 
   const parsed = shellParse(cleaned);
   const segments: Segment[] = [];
   let current: string[] = [];
 
-  for (const token of parsed) {
+  for (let i = 0; i < parsed.length; i++) {
+    const token = parsed[i];
+
     if (typeof token === "string") {
+      // Skip numeric fd preceding a redirect op (2 in "2>&1", "2>/dev/null")
+      if (
+        /^\d+$/.test(token) &&
+        i + 1 < parsed.length &&
+        typeof parsed[i + 1] === "object" &&
+        "op" in (parsed[i + 1] as any) &&
+        [">", ">>", ">&", "<"].includes((parsed[i + 1] as any).op)
+      ) {
+        i++; // skip fd
+        const opToken = parsed[i] as any;
+        if (opToken.op === ">&" && i + 1 < parsed.length) i++; // skip "&1" word
+        else if (i + 1 < parsed.length && typeof parsed[i + 1] === "string" && !["&&", "||", ";", "|"].includes(parsed[i + 1] as string)) {
+          i++; // skip filename after >, >>, <
+        }
+        continue;
+      }
+
       current.push(token);
     } else if (typeof token === "object" && "pattern" in token) {
       current.push((token as { pattern: string }).pattern);
     } else if (typeof token === "object" && "op" in token) {
-      // Operator — flush current segment and start a new one
-      if (current.length > 0) segments.push(current);
-      current = [];
+      const op = (token as { op: string }).op;
+
+      // Redirection operators — skip operator and its target word
+      if (op === ">" || op === ">>" || op === ">&" || op === "<" || op === "<<") {
+        if (i + 1 < parsed.length && typeof parsed[i + 1] === "string") i++; // skip target
+        continue;
+      }
+
+      // Segment separators — flush current and start a new one
+      if (op === "&&" || op === "||" || op === ";" || op === "|") {
+        if (current.length > 0) segments.push(current);
+        current = [];
+        continue;
+      }
+
+      // Other operators (&, \, etc.) — skip
     }
   }
   if (current.length > 0) segments.push(current);
@@ -609,6 +634,22 @@ function outputAllow() {
 }
 
 // ---------------------------------------------------------------------------
+// Error logging
+// ---------------------------------------------------------------------------
+
+const ERRORS_LOG = `${HOME}/.claude/auto-approve-errors.jsonl`;
+
+function logError(kind: string, message: string, command?: string) {
+  const entry = JSON.stringify({
+    kind,
+    message,
+    command: command?.slice(0, 500),
+    ts: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
+  });
+  try { appendFileSync(ERRORS_LOG, entry + "\n"); } catch {}
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -616,14 +657,16 @@ async function main() {
   let raw = "";
   try {
     raw = readFileSync("/dev/stdin", "utf8");
-  } catch {
+  } catch (err: any) {
+    logError("stdin-read", err?.message ?? String(err));
     process.exit(0);
   }
 
   let input: any;
   try {
     input = JSON.parse(raw);
-  } catch {
+  } catch (err: any) {
+    logError("json-parse", err?.message ?? String(err));
     process.exit(0);
   }
 
@@ -636,26 +679,38 @@ async function main() {
   const effectiveCommand = stripEnvLoaders(command);
 
   // Stage 1
-  const s1 = stage1(effectiveCommand);
-  if (s1.decision === "allow") {
-    logDecision("auto-approve-structural", command, s1.stage, s1.reason);
-    outputAllow();
-    process.exit(0);
+  try {
+    const s1 = stage1(effectiveCommand);
+    if (s1.decision === "allow") {
+      logDecision("auto-approve-structural", command, s1.stage, s1.reason);
+      outputAllow();
+      process.exit(0);
+    }
+  } catch (err: any) {
+    logError("stage1", err?.message ?? String(err), command);
+    // Fall through to stage 2
   }
 
   // Stage 2
-  const s2 = await stage2(effectiveCommand);
-  if (s2.decision === "allow") {
-    logDecision("auto-approve-haiku", command, s2.stage, s2.reason);
-    outputAllow();
-    process.exit(0);
+  try {
+    const s2 = await stage2(effectiveCommand);
+    if (s2.decision === "allow") {
+      logDecision("auto-approve-haiku", command, s2.stage, s2.reason);
+      outputAllow();
+      process.exit(0);
+    }
+  } catch (err: any) {
+    logError("stage2", err?.message ?? String(err), command);
   }
 
-  // Both stages skipped — fall through to user prompt
+  // Both stages skipped or errored — fall through to user prompt
   process.exit(0);
 }
 
 // Only run when executed directly, not when imported by tests
 if (require.main === module) {
-  main().catch(() => process.exit(0));
+  main().catch((err) => {
+    logError("main-unhandled", err?.message ?? String(err));
+    process.exit(0);
+  });
 }
