@@ -9,7 +9,7 @@ SAVE_HOME := scripts/save-home-config.sh
 SAVE_COMMON := scripts/save-common-config.sh
 RESTORE  := scripts/restore-config.sh
 
-.PHONY: all sanitize save-config save-common-config save-work-config save-home-config restore-config commit-push
+.PHONY: all sanitize save-config save-common-config save-work-config save-home-config restore-config commit-push test test-vitest test-hooks
 
 all: commit-push
 
@@ -42,7 +42,15 @@ restore-config:
 	@chmod +x $(RESTORE)
 	$(RESTORE)
 
-commit-push: save-config sanitize
+test: test-vitest test-hooks
+
+test-vitest:
+	npm test
+
+test-hooks:
+	@bash tests/block-dangerous-commands.test.sh
+
+commit-push: test save-config sanitize
 	@if [ -z "$(ENVIRONMENT)" ]; then \
 	  echo "ERROR: ENVIRONMENT is not set. Set ENVIRONMENT=work or ENVIRONMENT=home." >&2; exit 1; fi
 	git add -u

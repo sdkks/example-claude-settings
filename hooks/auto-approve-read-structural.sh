@@ -41,8 +41,9 @@ fi
 [ "$_SEEN" = "true" ] && exit 0
 
 approve() {
-  jq -nc --arg hook "$HOOK_NAME" --arg path "$FILE_PATH" --arg ts "$(date -u +%FT%TZ)" \
-    '{hook:$hook,file_path:$path,ts:$ts}' >> ~/.claude/permissionDecisions.jsonl
+  local reason="$1"
+  jq -nc --arg hook "$HOOK_NAME" --arg path "$FILE_PATH" --arg reason "$reason" --arg ts "$(date -u +%FT%TZ)" \
+    '{hook:$hook,stage:"structural",reason:$reason,file_path:$path,ts:$ts}' >> ~/.claude/permissionDecisions.jsonl
   jq -n '{
     hookSpecificOutput: {
       hookEventName: "PermissionRequest",
@@ -65,16 +66,18 @@ fi
 
 # Claude-native agent worktrees: <repo>/.claude/worktrees/agent-<hex>/...
 # The agent hash is assigned at spawn time and not statically enumerable.
-if echo "$FILE_PATH" | grep -qE "/.claude/worktrees/agent-[a-f0-9]+/"; then
+if echo "$FILE_PATH" | grep -qE "/[^/]+/\.claude/worktrees/agent-[a-f0-9]+/"; then
   approve "Allowed: Claude-native agent worktree file (variable agent-hash prefix)"
 fi
 
 # Generated SDLC and layer0 dirs inside any project under ~/Dev
+# e.g. ~/Dev/vibe/md-doc-analyst/generated/sdlc/...
+#      ~/Dev/vibe/qmem-llm/generated/layer0/...
 if echo "$FILE_PATH" | grep -qE "^$HOME/Dev/[^/]+/[^/]+/generated/(sdlc|layer0)/"; then
   approve "Allowed: generated SDLC/layer0 artifact (structural path)"
 fi
 
-# Nested generated dirs (one level deeper)
+# Nested generated dirs (one level deeper, e.g. Dev/vibe/<project>/generated/...)
 if echo "$FILE_PATH" | grep -qE "^$HOME/Dev/[^/]+/[^/]+/[^/]+/generated/(sdlc|layer0)/"; then
   approve "Allowed: generated SDLC/layer0 artifact (nested structural path)"
 fi
